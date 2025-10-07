@@ -2,16 +2,47 @@ const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const cors = require('cors');
 const bodyParser = require('body-parser');
+const multer = require('multer');
 const path = require('path');
+const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Configurar upload de arquivos
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const uploadDir = path.join(__dirname, '../uploads');
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    cb(null, uploadDir);
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+  }
+});
+
+const upload = multer({ 
+  storage: storage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Apenas arquivos de imagem são permitidos'), false);
+    }
+  }
+});
+
 // Middleware
 app.use(cors());
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: '10mb' }));
+app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
 app.use(express.static(path.join(__dirname, '../frontend')));
 app.use('/admin', express.static(path.join(__dirname, '../admin')));
+app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
 
 // Banco de dados
 const db = new sqlite3.Database('./db.sqlite');
@@ -45,6 +76,7 @@ db.serialize(() => {
     telefone TEXT NOT NULL,
     tipo TEXT NOT NULL,
     mensagem TEXT NOT NULL,
+    imagem TEXT,
     status TEXT DEFAULT 'pendente',
     data_criacao DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
@@ -60,7 +92,7 @@ db.serialize(() => {
   });
 });
 
-// === ROTAS PÚBLICAS (mantidas do seu código original) ===
+// === ROTAS PÚBLICAS ===
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, '../frontend/index.html'));
 });
@@ -68,7 +100,7 @@ app.get('/', (req, res) => {
 app.get('/api/news-by-category', (req, res) => {
   const query = `
     SELECT id, titulo, resumo, categoria, imagem, 
-           strftime('%d de %m de %Y às %H:%M', data_criacao) as data
+           strftime('%d/%m/%Y às %H:%M', data_criacao) as data
     FROM noticias
     ORDER BY data_criacao DESC
   `;
@@ -88,7 +120,7 @@ app.get('/api/noticia', (req, res) => {
   if (!id) return res.status(400).json({ error: 'ID necessário' });
   const query = `
     SELECT id, titulo, resumo, corpo, categoria, imagem,
-           strftime('%d de %m de %Y às %H:%M', data_criacao) as data
+           strftime('%d/%m/%Y às %H:%M', data_criacao) as data
     FROM noticias WHERE id = ?
   `;
   db.get(query, [id], (err, row) => {
@@ -101,7 +133,7 @@ app.get('/api/noticias', (req, res) => {
   const { categoria } = req.query;
   let query = `
     SELECT id, titulo, resumo, categoria, imagem,
-           strftime('%d de %m de %Y às %H:%M', data_criacao) as data
+           strftime('%d/%m/%Y às %H:%M', data_criacao) as data
     FROM noticias
   `;
   const params = [];
@@ -121,7 +153,7 @@ app.get('/api/search', (req, res) => {
   if (!q) return res.json([]);
   const query = `
     SELECT id, titulo, resumo, categoria, imagem,
-           strftime('%d de %m de %Y às %H:%M', data_criacao) as data
+           strftime('%d/%m/%Y às %H:%M', data_criacao) as data
     FROM noticias
     WHERE titulo LIKE ? OR resumo LIKE ? OR corpo LIKE ?
     ORDER BY data_criacao DESC
@@ -133,13 +165,15 @@ app.get('/api/search', (req, res) => {
   });
 });
 
-app.post('/api/add-ad', (req, res) => {
+app.post('/api/add-ad', upload.single('imagem'), (req, res) => {
   const { nome, empresa, email, telefone, tipo, mensagem } = req.body;
+  const imagem = req.file ? `/uploads/${req.file.filename}` : null;
+  
   const query = `
-    INSERT INTO anuncios (nome, empresa, email, telefone, tipo, mensagem)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO anuncios (nome, empresa, email, telefone, tipo, mensagem, imagem)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
   `;
-  db.run(query, [nome, empresa, email, telefone, tipo, mensagem], function(err) {
+  db.run(query, [nome, empresa, email, telefone, tipo, mensagem, imagem], function(err) {
     if (err) return res.status(500).json({ error: err.message });
     res.json({ id: this.lastID, success: true });
   });
@@ -217,11 +251,14 @@ app.get('/api/noticias-admin', authAdmin, (req, res) => {
   });
 });
 
-app.post('/api/add-news', authAdmin, (req, res) => {
-  const { titulo, categoria, resumo, corpo, imagem } = req.body;
+app.post('/api/add-news', authAdmin, upload.single('imagem'), (req, res) => {
+  const { titulo, categoria, resumo, corpo } = req.body;
+  const imagem = req.file ? `/uploads/${req.file.filename}` : null;
+  
   if (!titulo || !categoria || !resumo || !corpo) {
     return res.status(400).json({ error: 'Todos os campos obrigatórios devem ser preenchidos' });
   }
+  
   const query = `
     INSERT INTO noticias (titulo, categoria, resumo, corpo, imagem)
     VALUES (?, ?, ?, ?, ?)
@@ -235,7 +272,7 @@ app.post('/api/add-news', authAdmin, (req, res) => {
 // Anúncios
 app.get('/api/anuncios', authAdmin, (req, res) => {
   const query = `
-    SELECT id, nome, empresa, status,
+    SELECT id, nome, empresa, status, imagem,
            strftime('%d/%m/%Y', data_criacao) as data
     FROM anuncios
     ORDER BY data_criacao DESC
@@ -246,18 +283,51 @@ app.get('/api/anuncios', authAdmin, (req, res) => {
   });
 });
 
-app.post('/api/add-anuncio', authAdmin, (req, res) => {
+app.post('/api/add-anuncio', authAdmin, upload.single('imagem'), (req, res) => {
   const { nome, empresa, email, telefone, tipo, mensagem } = req.body;
+  const imagem = req.file ? `/uploads/${req.file.filename}` : null;
+  
   if (!nome || !empresa || !email || !telefone || !tipo || !mensagem) {
     return res.status(400).json({ error: 'Todos os campos são obrigatórios' });
   }
+  
   const query = `
-    INSERT INTO anuncios (nome, empresa, email, telefone, tipo, mensagem)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO anuncios (nome, empresa, email, telefone, tipo, mensagem, imagem)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
   `;
-  db.run(query, [nome, empresa, email, telefone, tipo, mensagem], function(err) {
+  db.run(query, [nome, empresa, email, telefone, tipo, mensagem, imagem], function(err) {
     if (err) return res.status(500).json({ error: err.message });
     res.json({ id: this.lastID, success: true });
+  });
+});
+
+app.delete('/api/delete-anuncio/:id', authAdmin, (req, res) => {
+  const { id } = req.params;
+  const { senha } = req.body;
+  
+  // Verificar senha do admin (em produção, use hash)
+  if (senha !== 'admin123') {
+    return res.status(401).json({ error: 'Senha do administrador incorreta' });
+  }
+  
+  // Verificar se o anúncio existe e obter o caminho da imagem
+  db.get('SELECT imagem FROM anuncios WHERE id = ?', [id], (err, row) => {
+    if (err) return res.status(500).json({ error: err.message });
+    if (!row) return res.status(404).json({ error: 'Anúncio não encontrado' });
+    
+    // Excluir arquivo de imagem se existir
+    if (row.imagem) {
+      const imagePath = path.join(__dirname, '..', row.imagem);
+      if (fs.existsSync(imagePath)) {
+        fs.unlinkSync(imagePath);
+      }
+    }
+    
+    // Excluir do banco
+    db.run('DELETE FROM anuncios WHERE id = ?', [id], function(err) {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ success: true });
+    });
   });
 });
 
@@ -286,6 +356,14 @@ app.get('/api/export-leads', authAdmin, (req, res) => {
   }, () => {
     res.end();
   });
+});
+
+// Upload de imagens
+app.post('/api/upload', authAdmin, upload.single('imagem'), (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'Nenhum arquivo enviado' });
+  }
+  res.json({ filename: `/uploads/${req.file.filename}` });
 });
 
 // Servir admin
