@@ -79,9 +79,10 @@ async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS usuarios (
       id SERIAL PRIMARY KEY,
+      nome TEXT NOT NULL,
       email TEXT UNIQUE NOT NULL,
-      senha TEXT,
-      nome TEXT,
+      senha TEXT NOT NULL,
+      idade INTEGER CHECK (idade >= 13 AND idade <= 120),
       is_admin BOOLEAN DEFAULT false,
       verificado BOOLEAN DEFAULT false,
       data_cadastro TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -118,9 +119,9 @@ async function initDB() {
   const admin = await pool.query("SELECT * FROM usuarios WHERE email = 'admin@admin.com'");
   if (admin.rows.length === 0) {
     await pool.query(
-      `INSERT INTO usuarios (email, senha, nome, is_admin, verificado) 
-       VALUES ($1, $2, $3, $4, $5)`,
-      ['admin@admin.com', 'admin123', 'Administrador', true, true]
+      `INSERT INTO usuarios (nome, email, senha, idade, is_admin, verificado) 
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      ['Administrador', 'admin@admin.com', 'admin123', 30, true, true]
     );
     console.log('✅ Usuário admin criado');
   }
@@ -189,16 +190,30 @@ app.post('/api/add-ad', upload.single('imagem'), async (req, res) => {
 // === AUTENTICAÇÃO ===
 
 app.post('/api/register', async (req, res) => {
-  const { email, password } = req.body;
+  const { name, email, age, password } = req.body;
+
+  if (!name || !email || !age || !password) {
+    return res.status(400).json({ error: 'Todos os campos são obrigatórios.' });
+  }
+
+  const idade = parseInt(age, 10);
+  if (isNaN(idade) || idade < 13 || idade > 120) {
+    return res.status(400).json({ error: 'Idade inválida. Deve estar entre 13 e 120 anos.' });
+  }
+
   try {
     const r = await pool.query(
-      `INSERT INTO usuarios (email, senha) VALUES ($1, $2) RETURNING id`,
-      [email, password]
+      `INSERT INTO usuarios (nome, email, idade, senha) VALUES ($1, $2, $3, $4) RETURNING id`,
+      [name.trim(), email.toLowerCase().trim(), idade, password]
     );
     res.json({ success: true, id: r.rows[0].id });
   } catch (e) {
-    if (e.code === '23505') res.status(400).json({ error: 'E-mail já cadastrado' });
-    else res.status(500).json({ error: e.message });
+    if (e.code === '23505') {
+      res.status(400).json({ error: 'E-mail já cadastrado.' });
+    } else {
+      console.error('Erro no cadastro:', e);
+      res.status(500).json({ error: 'Erro interno no servidor.' });
+    }
   }
 });
 
@@ -212,15 +227,20 @@ app.post('/api/login', async (req, res) => {
     if (r.rows.length > 0) {
       res.json({ success: true, token: 'fake-token', isAdmin: r.rows[0].is_admin });
     } else {
-      res.status(401).json({ error: 'Credenciais inválidas ou e-mail não verificado' });
+      res.status(401).json({ error: 'Credenciais inválidas ou e-mail não verificado.' });
     }
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// === VERIFICAÇÃO POR E-MAIL (COM Nodemailer) ===
+// === VERIFICAÇÃO POR E-MAIL ===
 
 app.post('/api/send-verification-code', async (req, res) => {
   const { email } = req.body;
+  const user = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email]);
+  if (user.rows.length === 0) {
+    return res.status(404).json({ error: 'E-mail não cadastrado.' });
+  }
+
   const code = generateCode();
   verificationCodes.set(email, { code, expiresAt: Date.now() + 10 * 60 * 1000 });
 
@@ -236,7 +256,7 @@ app.post('/api/send-verification-code', async (req, res) => {
       res.json({ success: true });
     } catch (err) {
       console.error('Erro ao enviar e-mail:', err);
-      res.status(500).json({ error: 'Falha ao enviar e-mail' });
+      res.status(500).json({ error: 'Falha ao enviar e-mail.' });
     }
   } else {
     console.warn('📧 Nodemailer não configurado. Código simulado:', code);
@@ -248,7 +268,7 @@ app.post('/api/verify-code', async (req, res) => {
   const { email, code } = req.body;
   const stored = verificationCodes.get(email);
   if (!stored || stored.code !== code || Date.now() > stored.expiresAt) {
-    return res.status(400).json({ error: 'Código inválido ou expirado' });
+    return res.status(400).json({ error: 'Código inválido ou expirado.' });
   }
   try {
     await pool.query(`UPDATE usuarios SET verificado = true WHERE email = $1`, [email]);
@@ -261,7 +281,7 @@ app.post('/api/send-password-reset', async (req, res) => {
   const { email } = req.body;
   const user = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email]);
   if (user.rows.length === 0) {
-    return res.status(404).json({ error: 'E-mail não encontrado' });
+    return res.status(404).json({ error: 'E-mail não encontrado.' });
   }
 
   const code = generateCode();
@@ -279,7 +299,7 @@ app.post('/api/send-password-reset', async (req, res) => {
       res.json({ success: true });
     } catch (err) {
       console.error('Erro ao enviar e-mail:', err);
-      res.status(500).json({ error: 'Falha ao enviar e-mail' });
+      res.status(500).json({ error: 'Falha ao enviar e-mail.' });
     }
   } else {
     console.warn('📧 Nodemailer não configurado. Código simulado:', code);
@@ -291,33 +311,12 @@ app.post('/api/reset-password', async (req, res) => {
   const { email, code, newPassword } = req.body;
   const stored = passwordResetCodes.get(email);
   if (!stored || stored.code !== code || Date.now() > stored.expiresAt) {
-    return res.status(400).json({ error: 'Código inválido ou expirado' });
+    return res.status(400).json({ error: 'Código inválido ou expirado.' });
   }
   try {
     await pool.query(`UPDATE usuarios SET senha = $1 WHERE email = $2`, [newPassword, email]);
     passwordResetCodes.delete(email);
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// === LOGIN COM GOOGLE (Firebase → Backend) ===
-
-app.post('/api/google-login', async (req, res) => {
-  const { email, name } = req.body;
-  try {
-    let user = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email]);
-    if (user.rows.length === 0) {
-      await pool.query(
-        `INSERT INTO usuarios (email, nome, verificado) VALUES ($1, $2, $3)`,
-        [email, name || email.split('@')[0], true]
-      );
-      user = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email]);
-    }
-    res.json({
-      success: true,
-      isAdmin: user.rows[0].is_admin,
-      token: 'google-token'
-    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
