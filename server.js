@@ -368,6 +368,52 @@ app.post('/api/add-news', authAdmin, upload.single('imagem'), async (req, res) =
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ✅ NOVA ROTA: ATUALIZAR NOTÍCIA
+app.put('/api/update-news', authAdmin, async (req, res) => {
+  const { id, titulo, categoria, resumo, corpo, imagem } = req.body;
+  if (!id || !titulo || !categoria || !resumo || !corpo) {
+    return res.status(400).json({ error: 'Campos obrigatórios faltando.' });
+  }
+  try {
+    await pool.query(
+      `UPDATE noticias SET titulo = $1, categoria = $2, resumo = $3, corpo = $4, imagem = $5 WHERE id = $6`,
+      [titulo, categoria, resumo, corpo, imagem, id]
+    );
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ✅ NOVA ROTA: EXCLUIR NOTÍCIA
+app.delete('/api/delete-news/:id', authAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { senha } = req.body;
+  if (senha !== 'admin123') {
+    return res.status(401).json({ error: 'Senha incorreta' });
+  }
+
+  try {
+    const noticia = await pool.query('SELECT imagem FROM noticias WHERE id = $1', [id]);
+    if (noticia.rows.length === 0) {
+      return res.status(404).json({ error: 'Notícia não encontrada' });
+    }
+
+    if (noticia.rows[0].imagem) {
+      const caminhoImagem = path.join(__dirname, noticia.rows[0].imagem);
+      if (fs.existsSync(caminhoImagem)) {
+        fs.unlinkSync(caminhoImagem);
+      }
+    }
+
+    await pool.query('DELETE FROM noticias WHERE id = $1', [id]);
+    res.json({ success: true });
+  } catch (e) {
+    console.error('Erro ao excluir notícia:', e);
+    res.status(500).json({ error: 'Erro interno ao excluir notícia' });
+  }
+});
+
 app.get('/api/anuncios', authAdmin, async (req, res) => {
   const r = await pool.query(`
     SELECT id, nome, empresa, status, imagem, TO_CHAR(data_criacao, 'DD/MM/YYYY') as data
