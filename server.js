@@ -322,7 +322,17 @@ app.post('/api/reset-password', async (req, res) => {
 
 // === ROTAS ADMIN ===
 
-const authAdmin = (req, res, next) => next();
+const authAdmin = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Não autenticado' });
+  
+  const token = authHeader.split(' ')[1];
+  if (token !== 'admin123') { // Em produção, use JWT ou outro sistema seguro
+    return res.status(403).json({ error: 'Acesso negado' });
+  }
+  
+  next();
+};
 
 app.get('/api/admin-dashboard', authAdmin, async (req, res) => {
   try {
