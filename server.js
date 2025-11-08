@@ -1,498 +1,450 @@
+// server.js - projeto completo
+require('dotenv').config();
 const express = require('express');
-const cors = require('cors');
 const bodyParser = require('body-parser');
+const cors = require('cors');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const { Pool } = require('pg');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const sqlite3 = require('sqlite3').verbose();
 const nodemailer = require('nodemailer');
+const { stringify: csvStringify } = require('csv-stringify/sync');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
+const JWT_SECRET = process.env.JWT_SECRET || 'troque_esta_chave_para_producao';
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || `http://localhost:${PORT}`;
 
-// === CONFIGURAÇÃO DE UPLOAD ===
-const uploadDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+app.use(bodyParser.json({ limit: '10mb' }));
+app.use(bodyParser.urlencoded({ extended: true }));
+app.use(cors({ origin: FRONTEND_ORIGIN, credentials: true }));
 
+// uploads dir
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir);
+
+// multer
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
+  destination: (req, file, cb) => cb(null, uploadsDir),
   filename: (req, file, cb) => {
-    const unique = Date.now() + '-' + Math.round(Math.random() * 1e9);
-    cb(null, file.fieldname + '-' + unique + path.extname(file.originalname));
+    const uniq = Date.now() + '-' + Math.round(Math.random() * 1e9);
+    cb(null, `img-${uniq}${path.extname(file.originalname)}`);
   }
 });
-
 const upload = multer({
   storage,
   limits: { fileSize: 5 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    cb(null, file.mimetype.startsWith('image/'));
-  }
+  fileFilter: (req, file, cb) => cb(null, file.mimetype.startsWith('image/'))
 });
 
-// === MIDDLEWARE ===
-app.use(cors({
-  origin: [
-    'https://gera-noticias.vercel.app',
-    'https://gera-painel-admin.vercel.app',
-    'http://localhost:3000',
-    'http://127.0.0.1:5500'
-  ],
-  credentials: true
-}));
-app.use(bodyParser.json({ limit: '10mb' }));
-app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
-app.use('/uploads', express.static(uploadDir));
-
-// === CONFIGURAÇÃO DO Nodemailer ===
-const EMAIL_USER = process.env.EMAIL_USER;
-const EMAIL_PASS = process.env.EMAIL_PASS;
-
+// nodemailer
 let transporter = null;
-if (EMAIL_USER && EMAIL_PASS) {
-  transporter = nodemailer.createTransporter({
+if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+  transporter = nodemailer.createTransport({
     host: 'smtp.gmail.com',
     port: 587,
     secure: false,
-    auth: { user: EMAIL_USER, pass: EMAIL_PASS }
+    auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
+  });
+  transporter.verify().then(() => console.log('✅ Nodemailer pronto')).catch(e => console.warn('⚠️ Nodemailer erro:', e.message));
+} else {
+  console.warn('⚠️ EMAIL_USER / EMAIL_PASS não configurados. Envio de e-mails será simulado em dev.');
+}
+
+// ========== Banco SQLite ==========
+const dbFile = path.join(__dirname, 'gera.db');
+const db = new sqlite3.Database(dbFile);
+
+function runAsync(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function (err) {
+      if (err) reject(err);
+      else resolve(this);
+    });
+  });
+}
+function allAsync(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (err, rows) => (err ? reject(err) : resolve(rows)));
+  });
+}
+function getAsync(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => (err ? reject(err) : resolve(row)));
   });
 }
 
-// Armazenamento temporário de códigos (em produção, use Redis)
-const verificationCodes = new Map();
-const passwordResetCodes = new Map();
-
-function generateCode() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
-}
-
-// === CONEXÃO COM POSTGRESQL ===
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false
-  }
-});
-
-// === INICIALIZAR BANCO ===
 async function initDB() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS usuarios (
-      id SERIAL PRIMARY KEY,
-      nome TEXT NOT NULL,
-      email TEXT UNIQUE NOT NULL,
-      senha TEXT NOT NULL,
-      idade INTEGER CHECK (idade >= 13 AND idade <= 120),
-      is_admin BOOLEAN DEFAULT false,
-      verificado BOOLEAN DEFAULT false,
-      data_cadastro TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
+  await runAsync(`CREATE TABLE IF NOT EXISTS usuarios (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    nome TEXT NOT NULL,
+    email TEXT NOT NULL UNIQUE,
+    senha TEXT NOT NULL,
+    idade INTEGER,
+    verificado INTEGER DEFAULT 0,
+    data_cadastro TEXT DEFAULT CURRENT_TIMESTAMP
+  )`);
 
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS noticias (
-      id SERIAL PRIMARY KEY,
-      titulo TEXT NOT NULL,
-      resumo TEXT NOT NULL,
-      corpo TEXT NOT NULL,
-      categoria TEXT NOT NULL,
-      imagem TEXT,
-      data_criacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
+  await runAsync(`CREATE TABLE IF NOT EXISTS noticias (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    titulo TEXT NOT NULL,
+    resumo TEXT NOT NULL,
+    corpo TEXT NOT NULL,
+    categoria TEXT NOT NULL,
+    imagem TEXT,
+    data_criacao TEXT DEFAULT CURRENT_TIMESTAMP
+  )`);
 
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS anuncios (
-      id SERIAL PRIMARY KEY,
-      nome TEXT NOT NULL,
-      empresa TEXT NOT NULL,
-      email TEXT NOT NULL,
-      telefone TEXT NOT NULL,
-      tipo TEXT NOT NULL,
-      mensagem TEXT NOT NULL,
-      imagem TEXT,
-      status TEXT DEFAULT 'pendente',
-      data_criacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
+  await runAsync(`CREATE TABLE IF NOT EXISTS anuncios (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    nome TEXT NOT NULL,
+    empresa TEXT NOT NULL,
+    email TEXT NOT NULL,
+    telefone TEXT NOT NULL,
+    tipo TEXT NOT NULL,
+    mensagem TEXT NOT NULL,
+    imagem TEXT,
+    status TEXT DEFAULT 'pendente',
+    data_criacao TEXT DEFAULT CURRENT_TIMESTAMP
+  )`);
 
-  const admin = await pool.query("SELECT * FROM usuarios WHERE email = 'admin@admin.com'");
-  if (admin.rows.length === 0) {
-    await pool.query(
-      `INSERT INTO usuarios (nome, email, senha, idade, is_admin, verificado) 
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      ['Administrador', 'admin@admin.com', 'admin123', 30, true, true]
-    );
-    console.log('✅ Usuário admin criado');
+  // cria admin se não existir
+  const adminEmail = process.env.ADMIN_EMAIL || 'admin@admin.com';
+  const adminPass = process.env.ADMIN_PASS || 'admin123';
+  const admin = await getAsync('SELECT * FROM usuarios WHERE email = ?', [adminEmail]).catch(() => null);
+  if (!admin) {
+    const hashed = await bcrypt.hash(adminPass, 10);
+    await runAsync('INSERT INTO usuarios (nome,email,senha,idade,verificado) VALUES (?,?,?,?,1)',
+      ['Administrador', adminEmail, hashed, 30]);
+    console.log('✅ Admin criado:', adminEmail);
   }
 }
 initDB().catch(console.error);
 
-// === ROTAS PÚBLICAS ===
+// === Verification code storage (in-memory) ===
+const verificationCodes = new Map(); // email -> { code, expiresAt }
 
-app.get('/api/destaque', async (req, res) => {
+// helper
+function generateCode6() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+// serve static frontend and uploads
+app.use('/uploads', express.static(uploadsDir));
+app.use(express.static(path.join(__dirname, 'public')));
+
+// ========== ROTAS PÚBLICAS ==========
+
+// auth middleware
+function authenticateAdmin(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth) return res.status(401).json({ error: 'Não autenticado' });
+  const parts = auth.split(' ');
+  if (parts.length !== 2) return res.status(401).json({ error: 'Formato de token inválido' });
+  const token = parts[1];
   try {
-    const r = await pool.query(`SELECT id, titulo, resumo, imagem FROM noticias ORDER BY data_criacao DESC LIMIT 1`);
-    res.json(r.rows[0] || {});
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
+    const data = jwt.verify(token, JWT_SECRET);
+    if (!data.isAdmin) return res.status(403).json({ error: 'Acesso negado' });
+    req.user = data;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Token inválido' });
+  }
+}
+// listar notícias (público)
 app.get('/api/noticias', async (req, res) => {
   try {
-    const { categoria } = req.query;
-    let q = `SELECT id, titulo, resumo, categoria, imagem, TO_CHAR(data_criacao, 'DD/MM/YYYY às HH24:MI') as data FROM noticias`;
-    const p = [];
-    if (categoria) { q += ' WHERE categoria = $1'; p.push(categoria); }
-    q += ' ORDER BY data_criacao DESC';
-    const r = await pool.query(q, p);
-    res.json(r.rows);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const rows = await allAsync('SELECT id,titulo,resumo,categoria,imagem,data_criacao FROM noticias ORDER BY data_criacao DESC');
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ver 1 noticia
 app.get('/api/noticia', async (req, res) => {
-  const { id } = req.query;
-  if (!id) return res.status(400).json({ error: 'ID necessário' });
+  const id = req.query.id;
+  if (!id) return res.status(400).json({ error: 'id requerido' });
   try {
-    const r = await pool.query(
-      `SELECT id, titulo, resumo, corpo, categoria, imagem, TO_CHAR(data_criacao, 'DD/MM/YYYY às HH24:MI') as data 
-       FROM noticias WHERE id = $1`, [id]
-    );
-    res.json(r.rows[0] || {});
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const row = await getAsync('SELECT * FROM noticias WHERE id = ?', [id]);
+    res.json(row || {});
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/api/search', async (req, res) => {
-  const { q } = req.query;
-  if (!q) return res.json([]);
-  try {
-    const r = await pool.query(
-      `SELECT id, titulo, resumo, categoria, imagem, TO_CHAR(data_criacao, 'DD/MM/YYYY às HH24:MI') as data 
-       FROM noticias WHERE titulo ILIKE $1 OR resumo ILIKE $1 OR corpo ILIKE $1 
-       ORDER BY data_criacao DESC`, [`%${q}%`]
-    );
-    res.json(r.rows);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
+// enviar anúncio (public)
 app.post('/api/add-ad', upload.single('imagem'), async (req, res) => {
-  const { nome, empresa, email, telefone, tipo, mensagem } = req.body;
-  const img = req.file ? `/uploads/${req.file.filename}` : null;
   try {
-    const r = await pool.query(
-      `INSERT INTO anuncios (nome, empresa, email, telefone, tipo, mensagem, imagem) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-      [nome, empresa, email, telefone, tipo, mensagem, img]
+    const { nome, empresa, email, telefone, tipo, mensagem } = req.body;
+    if (!nome || !empresa || !email || !telefone || !tipo || !mensagem) {
+      return res.status(400).json({ error: 'Campos obrigatórios faltando' });
+    }
+    const imagem = req.file ? `/uploads/${req.file.filename}` : null;
+    const r = await runAsync(
+      'INSERT INTO anuncios (nome,empresa,email,telefone,tipo,mensagem,imagem) VALUES (?,?,?,?,?,?,?)',
+      [nome, empresa, email, telefone, tipo, mensagem, imagem]
     );
-    res.json({ id: r.rows[0].id, success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    res.json({ success: true, id: r.lastID });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// === AUTENTICAÇÃO ===
+// ========== AUTENTICAÇÃO E VERIFICAÇÃO ==========
 
+// registro: cria usuário (verificado = false) e envia código automaticamente
 app.post('/api/register', async (req, res) => {
-  const { name, email, age, password } = req.body;
-
-  if (!name || !email || !age || !password) {
-    return res.status(400).json({ error: 'Todos os campos são obrigatórios.' });
-  }
-
-  const idade = parseInt(age, 10);
-  if (isNaN(idade) || idade < 13 || idade > 120) {
-    return res.status(400).json({ error: 'Idade inválida. Deve estar entre 13 e 120 anos.' });
-  }
-
   try {
-    const r = await pool.query(
-      `INSERT INTO usuarios (nome, email, idade, senha) VALUES ($1, $2, $3, $4) RETURNING id`,
-      [name.trim(), email.toLowerCase().trim(), idade, password]
-    );
-    res.json({ success: true, id: r.rows[0].id });
-  } catch (e) {
-    if (e.code === '23505') {
-      res.status(400).json({ error: 'E-mail já cadastrado.' });
+    const { nome, email, senha, idade } = req.body;
+    if (!nome || !email || !senha || !idade) return res.status(400).json({ error: 'Todos os campos são obrigatórios.' });
+    const age = parseInt(idade, 10);
+    if (isNaN(age) || age < 13 || age > 120) return res.status(400).json({ error: 'Idade inválida.' });
+
+    const hashed = await bcrypt.hash(senha, 10);
+    const inserted = await runAsync('INSERT INTO usuarios (nome,email,senha,idade,verificado) VALUES (?,?,?,?,0)',
+      [nome, email.toLowerCase(), hashed, age]);
+    // envia código
+    const code = generateCode6();
+    verificationCodes.set(email.toLowerCase(), { code, expiresAt: Date.now() + 3 * 60 * 1000 });
+    if (transporter) {
+      await transporter.sendMail({
+        from: process.env.EMAIL_USER,
+        to: email,
+        subject: 'Código de verificação - GERA',
+        text: `Seu código de verificação é: ${code}\nValido por 3 minutos.`
+      });
+      return res.json({ success: true, message: 'Usuário criado. Código enviado por e-mail.' });
     } else {
-      console.error('Erro no cadastro:', e);
-      res.status(500).json({ error: 'Erro interno no servidor.' });
+      // dev fallback
+      return res.json({ success: true, message: 'Usuário criado (dev). Código (simulado) retornado.', simulatedCode: code });
     }
+  } catch (err) {
+    if (err && err.message && err.message.includes('UNIQUE constraint failed')) {
+      return res.status(400).json({ error: 'E-mail já cadastrado.' });
+    }
+    return res.status(500).json({ error: err.message });
   }
 });
 
-app.post('/api/login', async (req, res) => {
-  const { email, password } = req.body;
-  try {
-    const r = await pool.query(
-      `SELECT id, email, is_admin FROM usuarios WHERE email = $1 AND senha = $2 AND verificado = true`,
-      [email, password]
-    );
-    if (r.rows.length > 0) {
-      res.json({ success: true, token: 'fake-token', isAdmin: r.rows[0].is_admin });
-    } else {
-      res.status(401).json({ error: 'Credenciais inválidas ou e-mail não verificado.' });
-    }
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// === VERIFICAÇÃO POR E-MAIL ===
-
+// reenviar código
 app.post('/api/send-verification-code', async (req, res) => {
-  const { email } = req.body;
-  const user = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email]);
-  if (user.rows.length === 0) {
-    return res.status(404).json({ error: 'E-mail não cadastrado.' });
-  }
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'email obrigatório' });
+    const user = await getAsync('SELECT * FROM usuarios WHERE email = ?', [email.toLowerCase()]);
+    if (!user) return res.status(404).json({ error: 'E-mail não cadastrado' });
 
-  const code = generateCode();
-  verificationCodes.set(email, { code, expiresAt: Date.now() + 10 * 60 * 1000 });
-
-  if (transporter) {
-    try {
+    const code = generateCode6();
+    verificationCodes.set(email.toLowerCase(), { code, expiresAt: Date.now() + 3 * 60 * 1000 });
+    if (transporter) {
       await transporter.sendMail({
-        from: EMAIL_USER,
+        from: process.env.EMAIL_USER,
         to: email,
-        subject: 'Verifique seu e-mail - GERA',
-        text: `Seu código de verificação é: ${code}\n\nEste código expira em 10 minutos.`
+        subject: 'Código de verificação - GERA',
+        text: `Seu código de verificação é: ${code}\nValido por 3 minutos.`
       });
-      console.log(`📧 Código enviado para ${email}`);
-      res.json({ success: true });
-    } catch (err) {
-      console.error('Erro ao enviar e-mail:', err);
-      res.status(500).json({ error: 'Falha ao enviar e-mail.' });
+      return res.json({ success: true });
+    } else {
+      return res.json({ success: true, simulatedCode: code });
     }
-  } else {
-    console.warn('📧 Nodemailer não configurado. Código simulado:', code);
-    res.json({ success: true });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// verificar o código
 app.post('/api/verify-code', async (req, res) => {
-  const { email, code } = req.body;
-  const stored = verificationCodes.get(email);
-  if (!stored || stored.code !== code || Date.now() > stored.expiresAt) {
-    return res.status(400).json({ error: 'Código inválido ou expirado.' });
-  }
   try {
-    await pool.query(`UPDATE usuarios SET verificado = true WHERE email = $1`, [email]);
-    verificationCodes.delete(email);
-    res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/send-password-reset', async (req, res) => {
-  const { email } = req.body;
-  const user = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email]);
-  if (user.rows.length === 0) {
-    return res.status(404).json({ error: 'E-mail não encontrado.' });
-  }
-
-  const code = generateCode();
-  passwordResetCodes.set(email, { code, expiresAt: Date.now() + 10 * 60 * 1000 });
-
-  if (transporter) {
-    try {
-      await transporter.sendMail({
-        from: EMAIL_USER,
-        to: email,
-        subject: 'Redefina sua senha - GERA',
-        text: `Seu código de recuperação é: ${code}\n\nEste código expira em 10 minutos.`
-      });
-      console.log(`🔑 Código de recuperação enviado para ${email}`);
-      res.json({ success: true });
-    } catch (err) {
-      console.error('Erro ao enviar e-mail:', err);
-      res.status(500).json({ error: 'Falha ao enviar e-mail.' });
+    const { email, code } = req.body;
+    if (!email || !code) return res.status(400).json({ error: 'email e code obrigatórios' });
+    const stored = verificationCodes.get(email.toLowerCase());
+    if (!stored || stored.code !== String(code) || Date.now() > stored.expiresAt) {
+      return res.status(400).json({ error: 'Código inválido ou expirado' });
     }
-  } else {
-    console.warn('📧 Nodemailer não configurado. Código simulado:', code);
+    await runAsync('UPDATE usuarios SET verificado = 1 WHERE email = ?', [email.toLowerCase()]);
+    verificationCodes.delete(email.toLowerCase());
     res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+// Upload genérico de imagem (usado pelo frontend do admin)
+app.post('/api/upload', authenticateAdmin, upload.single('imagem'), (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'Nenhum arquivo enviado ou arquivo inválido.' });
+    }
+    // Retorna o caminho público da imagem
+    const imageUrl = `/uploads/${req.file.filename}`;
+    res.json({ success: true, imageUrl, filename: req.file.filename });
+  } catch (err) {
+    console.error('Erro no upload:', err);
+    res.status(500).json({ error: 'Erro interno ao fazer upload.' });
   }
 });
-
-app.post('/api/reset-password', async (req, res) => {
-  const { email, code, newPassword } = req.body;
-  const stored = passwordResetCodes.get(email);
-  if (!stored || stored.code !== code || Date.now() > stored.expiresAt) {
-    return res.status(400).json({ error: 'Código inválido ou expirado.' });
-  }
+// login usuário (apenas verificados)
+app.post('/api/login', async (req, res) => {
   try {
-    await pool.query(`UPDATE usuarios SET senha = $1 WHERE email = $2`, [newPassword, email]);
-    passwordResetCodes.delete(email);
-    res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const { email, senha } = req.body;
+    if (!email || !senha) return res.status(400).json({ error: 'email e senha obrigatórios' });
+    const user = await getAsync('SELECT * FROM usuarios WHERE email = ?', [email.toLowerCase()]);
+    if (!user) return res.status(401).json({ error: 'Credenciais inválidas' });
+    const ok = await bcrypt.compare(senha, user.senha);
+    if (!ok) return res.status(401).json({ error: 'Credenciais inválidas' });
+    if (user.verificado !== 1) return res.status(401).json({ error: 'E-mail não verificado' });
+    const token = jwt.sign({ id: user.id, email: user.email, isAdmin: false }, JWT_SECRET, { expiresIn: '12h' });
+    res.json({ success: true, token, nome: user.nome });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// === ROTAS ADMIN ===
-
-const authAdmin = async (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: 'Não autenticado' });
-  
-  const token = authHeader.split(' ')[1];
-  if (token !== 'admin123') { // Em produção, use JWT ou outro sistema seguro
-    return res.status(403).json({ error: 'Acesso negado' });
-  }
-  
-  next();
-};
-
-app.get('/api/admin-dashboard', authAdmin, async (req, res) => {
+// admin login (gera token admin)
+app.post('/api/admin/login', async (req, res) => {
   try {
-    const [u, n, a] = await Promise.all([
-      pool.query('SELECT COUNT(*) as total FROM usuarios'),
-      pool.query('SELECT COUNT(*) as total FROM noticias'),
-      pool.query('SELECT COUNT(*) as total FROM anuncios WHERE status = $1', ['ativo'])
-    ]);
+    const { email, senha } = req.body;
+    if (!email || !senha) return res.status(400).json({ error: 'email e senha obrigatórios' });
+    const user = await getAsync('SELECT * FROM usuarios WHERE email = ?', [email.toLowerCase()]);
+    if (!user) return res.status(401).json({ error: 'Credenciais inválidas' });
+    const ok = await bcrypt.compare(senha, user.senha);
+    if (!ok) return res.status(401).json({ error: 'Credenciais inválidas' });
+    // apenas admin (criado manualmente) terá isAdmin true por convenção (email ADMIN_EMAIL)
+    const isAdmin = (email.toLowerCase() === (process.env.ADMIN_EMAIL || 'admin@admin.com').toLowerCase());
+    if (!isAdmin) return res.status(403).json({ error: 'Acesso negado. Usuário não é administrador.' });
+    const token = jwt.sign({ id: user.id, email: user.email, isAdmin: true }, JWT_SECRET, { expiresIn: '12h' });
+    res.json({ success: true, token, isAdmin: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+
+
+// ========== ROTAS ADMIN (protegidas) ==========
+
+// dashboard counts
+app.get('/api/admin/dashboard', authenticateAdmin, async (req, res) => {
+  try {
+    const usuarios = await getAsync('SELECT COUNT(*) as c FROM usuarios');
+    const noticias = await getAsync('SELECT COUNT(*) as c FROM noticias');
+    const anuncios = await getAsync('SELECT COUNT(*) as c FROM anuncios');
     res.json({
-      totalUsuarios: parseInt(u.rows[0].total),
-      totalNoticias: parseInt(n.rows[0].total),
-      totalAnuncios: parseInt(a.rows[0].total)
+      totalUsuarios: usuarios.c || 0,
+      totalNoticias: noticias.c || 0,
+      totalAnuncios: anuncios.c || 0
     });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/api/realtime', authAdmin, (req, res) => {
-  res.json([
-    { usuario: 'admin', acao: 'Login', categoria: 'Sistema', data: new Date().toISOString() },
-    { usuario: 'joao@email.com', acao: 'Visualizou Política', categoria: 'Política', data: new Date(Date.now() - 3600000).toISOString() }
-  ]);
-});
-
-app.get('/api/noticias-admin', authAdmin, async (req, res) => {
-  const r = await pool.query(`
-    SELECT id, titulo, categoria, TO_CHAR(data_criacao, 'DD/MM/YYYY HH24:MI') as data
-    FROM noticias ORDER BY data_criacao DESC
-  `);
-  res.json(r.rows);
-});
-
-app.post('/api/add-news', authAdmin, upload.single('imagem'), async (req, res) => {
-  const { titulo, categoria, resumo, corpo } = req.body;
-  const img = req.file ? `/uploads/${req.file.filename}` : null;
-  if (!titulo || !categoria || !resumo || !corpo) return res.status(400).json({ error: 'Campos obrigatórios' });
+// listar usuários
+app.get('/api/admin/users', authenticateAdmin, async (req, res) => {
   try {
-    const r = await pool.query(
-      `INSERT INTO noticias (titulo, categoria, resumo, corpo, imagem) 
-       VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-      [titulo, categoria, resumo, corpo, img]
-    );
-    res.json({ id: r.rows[0].id, success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const rows = await allAsync('SELECT id,nome,email,idade,verificado,data_cadastro FROM usuarios ORDER BY data_cadastro DESC');
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ✅ NOVA ROTA: ATUALIZAR NOTÍCIA
-app.put('/api/update-news', authAdmin, async (req, res) => {
-  const { id, titulo, categoria, resumo, corpo, imagem } = req.body;
-  if (!id || !titulo || !categoria || !resumo || !corpo) {
-    return res.status(400).json({ error: 'Campos obrigatórios faltando.' });
-  }
+// export leads CSV
+app.get('/api/admin/export-leads', authenticateAdmin, async (req, res) => {
   try {
-    await pool.query(
-      `UPDATE noticias SET titulo = $1, categoria = $2, resumo = $3, corpo = $4, imagem = $5 WHERE id = $6`,
-      [titulo, categoria, resumo, corpo, imagem, id]
-    );
-    res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+    const rows = await allAsync('SELECT nome,email,data_cadastro FROM usuarios ORDER BY data_cadastro DESC');
+    const csv = csvStringify(rows, { header: true });
+    res.header('Content-Type', 'text/csv');
+    res.attachment(`leads_${new Date().toISOString().slice(0,10)}.csv`);
+    res.send(csv);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ✅ NOVA ROTA: EXCLUIR NOTÍCIA
-app.delete('/api/delete-news/:id', authAdmin, async (req, res) => {
-  const { id } = req.params;
-  const { senha } = req.body;
-  if (senha !== 'admin123') {
-    return res.status(401).json({ error: 'Senha incorreta' });
-  }
-
+// CRUD notícias (admin)
+app.get('/api/admin/news', authenticateAdmin, async (req, res) => {
   try {
-    const noticia = await pool.query('SELECT imagem FROM noticias WHERE id = $1', [id]);
-    if (noticia.rows.length === 0) {
-      return res.status(404).json({ error: 'Notícia não encontrada' });
+    const rows = await allAsync('SELECT id,titulo,categoria,resumo,imagem,data_criacao FROM noticias ORDER BY data_criacao DESC');
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/admin/news', authenticateAdmin, upload.single('imagem'), async (req, res) => {
+  try {
+    const { titulo, resumo, corpo, categoria } = req.body;
+    if (!titulo || !resumo || !corpo || !categoria) return res.status(400).json({ error: 'Campos obrigatórios' });
+    const imagem = req.file ? `/uploads/${req.file.filename}` : null;
+    const r = await runAsync('INSERT INTO noticias (titulo,resumo,corpo,categoria,imagem) VALUES (?,?,?,?,?)',
+      [titulo, resumo, corpo, categoria, imagem]);
+    res.json({ success: true, id: r.lastID });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/admin/news/:id', authenticateAdmin, upload.single('imagem'), async (req, res) => {
+  try {
+    const id = req.params.id;
+    const { titulo, resumo, corpo, categoria, imagemUrl } = req.body;
+    const newImage = req.file ? `/uploads/${req.file.filename}` : (imagemUrl || null);
+    // se trocar imagem, remover arquivo antigo
+    const old = await getAsync('SELECT imagem FROM noticias WHERE id = ?', [id]);
+    if (req.file && old && old.imagem) {
+      const oldPath = path.join(__dirname, old.imagem);
+      if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
     }
-
-    if (noticia.rows[0].imagem) {
-      const caminhoImagem = path.join(__dirname, noticia.rows[0].imagem);
-      if (fs.existsSync(caminhoImagem)) {
-        fs.unlinkSync(caminhoImagem);
-      }
-    }
-
-    await pool.query('DELETE FROM noticias WHERE id = $1', [id]);
+    await runAsync('UPDATE noticias SET titulo=?,resumo=?,corpo=?,categoria=?,imagem=? WHERE id=?',
+      [titulo, resumo, corpo, categoria, newImage, id]);
     res.json({ success: true });
-  } catch (e) {
-    console.error('Erro ao excluir notícia:', e);
-    res.status(500).json({ error: 'Erro interno ao excluir notícia' });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/api/anuncios', authAdmin, async (req, res) => {
-  const r = await pool.query(`
-    SELECT id, nome, empresa, status, imagem, TO_CHAR(data_criacao, 'DD/MM/YYYY') as data
-    FROM anuncios ORDER BY data_criacao DESC
-  `);
-  res.json(r.rows);
-});
-
-app.post('/api/add-anuncio', authAdmin, upload.single('imagem'), async (req, res) => {
-  const { nome, empresa, email, telefone, tipo, mensagem } = req.body;
-  const img = req.file ? `/uploads/${req.file.filename}` : null;
-  if (!nome || !empresa || !email || !telefone || !tipo || !mensagem) return res.status(400).json({ error: 'Campos obrigatórios' });
+app.delete('/api/admin/news/:id', authenticateAdmin, async (req, res) => {
   try {
-    const r = await pool.query(
-      `INSERT INTO anuncios (nome, empresa, email, telefone, tipo, mensagem, imagem) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-      [nome, empresa, email, telefone, tipo, mensagem, img]
-    );
-    res.json({ id: r.rows[0].id, success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.delete('/api/delete-anuncio/:id', authAdmin, async (req, res) => {
-  const { id } = req.params;
-  const { senha } = req.body;
-  if (senha !== 'admin123') return res.status(401).json({ error: 'Senha incorreta' });
-  try {
-    const anuncio = await pool.query('SELECT imagem FROM anuncios WHERE id = $1', [id]);
-    if (anuncio.rows.length === 0) return res.status(404).json({ error: 'Anúncio não encontrado' });
-    if (anuncio.rows[0].imagem) {
-      const p = path.join(__dirname, anuncio.rows[0].imagem);
-      if (fs.existsSync(p)) fs.unlinkSync(p);
+    const id = req.params.id;
+    const old = await getAsync('SELECT imagem FROM noticias WHERE id = ?', [id]);
+    if (old && old.imagem) {
+      const oldPath = path.join(__dirname, old.imagem);
+      if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
     }
-    await pool.query('DELETE FROM anuncios WHERE id = $1', [id]);
+    await runAsync('DELETE FROM noticias WHERE id = ?', [id]);
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/api/usuarios', authAdmin, async (req, res) => {
-  const r = await pool.query(`
-    SELECT nome, email, TO_CHAR(data_cadastro, 'DD/MM/YYYY') as data_cadastro
-    FROM usuarios ORDER BY data_cadastro DESC
-  `);
-  res.json(r.rows);
+// CRUD anúncios (admin)
+app.get('/api/admin/ads', authenticateAdmin, async (req, res) => {
+  try {
+    const rows = await allAsync('SELECT id,nome,empresa,email,telefone,tipo,status,imagem,data_criacao FROM anuncios ORDER BY data_criacao DESC');
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/api/export-leads', authAdmin, async (req, res) => {
-  res.setHeader('Content-Type', 'text/csv');
-  res.setHeader('Content-Disposition', 'attachment; filename=leads_usuarios.csv');
-  res.write('Nome,E-mail,Data de Cadastro\n');
-  const r = await pool.query('SELECT nome, email, data_cadastro FROM usuarios');
-  r.rows.forEach(row => {
-    res.write(`"${row.nome || ''}","${row.email}","${row.data_cadastro}"\n`);
-  });
-  res.end();
+app.post('/api/admin/ads', authenticateAdmin, upload.single('imagem'), async (req, res) => {
+  try {
+    const { nome, empresa, email, telefone, tipo, mensagem } = req.body;
+    if (!nome || !empresa || !email || !telefone || !tipo || !mensagem) return res.status(400).json({ error: 'Campos obrigatórios' });
+    const imagem = req.file ? `/uploads/${req.file.filename}` : null;
+    const r = await runAsync('INSERT INTO anuncios (nome,empresa,email,telefone,tipo,mensagem,imagem) VALUES (?,?,?,?,?,?,?)',
+      [nome,empresa,email,telefone,tipo,mensagem,imagem]);
+    res.json({ success: true, id: r.lastID });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/upload', authAdmin, upload.single('imagem'), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'Nenhum arquivo' });
-  res.json({ filename: `/uploads/${req.file.filename}` });
+app.put('/api/admin/ads/:id', authenticateAdmin, upload.single('imagem'), async (req, res) => {
+  try {
+    const id = req.params.id;
+    const { nome, empresa, email, telefone, tipo, mensagem, status, imagemUrl } = req.body;
+    const newImage = req.file ? `/uploads/${req.file.filename}` : (imagemUrl || null);
+    const old = await getAsync('SELECT imagem FROM anuncios WHERE id = ?', [id]);
+    if (req.file && old && old.imagem) {
+      const oldPath = path.join(__dirname, old.imagem);
+      if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
+    }
+    await runAsync('UPDATE anuncios SET nome=?,empresa=?,email=?,telefone=?,tipo=?,mensagem=?,status=?,imagem=? WHERE id=?',
+      [nome,empresa,email,telefone,tipo,mensagem,status || 'pendente',newImage,id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Rota raiz
-app.get('/', (req, res) => {
-  res.json({ message: 'API GERA funcionando', time: new Date().toISOString() });
+app.delete('/api/admin/ads/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const old = await getAsync('SELECT imagem FROM anuncios WHERE id = ?', [id]);
+    if (old && old.imagem) {
+      const oldPath = path.join(__dirname, old.imagem);
+      if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
+    }
+    await runAsync('DELETE FROM anuncios WHERE id = ?', [id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Iniciar servidor
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`✅ Backend rodando em http://localhost:${PORT}`);
-  console.log(`🔗 URL pública: https://backend-gera.onrender.com`);
+// fallback
+app.get('/', (req,res) => res.sendFile(path.join(__dirname,'public','index.html')));
+
+// start
+app.listen(PORT, () => {
+  console.log(`🚀 Server rodando em http://localhost:${PORT}`);
 });
