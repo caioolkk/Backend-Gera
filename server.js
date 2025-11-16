@@ -133,7 +133,7 @@ function generateCode6() {
 
 // serve static frontend and uploads
 app.use('/uploads', express.static(uploadsDir));
-app.use(express.static(path.join(__dirname, 'public')));
+
 
 // ========== ROTAS PÚBLICAS ==========
 
@@ -441,8 +441,10 @@ app.delete('/api/admin/ads/:id', authenticateAdmin, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// fallback
-app.get('/', (req,res) => res.sendFile(path.join(__dirname,'public','index.html')));
+app.get('/', (req, res) => {
+  res.json({ status: 'API online' });
+});
+
 
 // start
 app.listen(PORT, () => {
